@@ -13,9 +13,8 @@ from flask_cors import CORS
 from flask_compress import Compress
 import markdown
 import argparse
-from transformers import AutoTokenizer, AutoProcessor, pipeline
-from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM
-from transformers import BlipForConditionalGeneration
+from transformers import AutoTokenizer, pipeline
+from transformers import AutoModelForSeq2SeqLM
 import unicodedata
 import torch
 import time
@@ -87,6 +86,15 @@ parser.add_argument(
     "--secure", action="store_true", help="Enforces the use of an API key"
 )
 parser.add_argument("--talkinghead-gpu", action="store_true", help="Run the talkinghead animation on the GPU (CPU is default)")
+parser.add_argument(
+    "--talkinghead-model", type=str, help="The THA3 model to use. 'float' models are fp32, 'half' are fp16. 'auto' (default) picks fp16 for GPU and fp32 for CPU.",
+    required=False, default="auto",
+    choices=["auto", "standard_float", "separable_float", "standard_half", "separable_half"],
+)
+parser.add_argument(
+    "--talkinghead-models", type=str, help="If THA3 models are not yet installed, use the given HuggingFace repository to install them.",
+    default="OktayAlpk/talking-head-anime-3"
+)
 
 parser.add_argument("--coqui-gpu", action="store_true", help="Run the voice models on the GPU (CPU is default)")
 parser.add_argument("--coqui-models", help="Install given Coqui-api TTS model at launch (comma separated list, last one will be loaded at start)")
@@ -181,21 +189,41 @@ if not torch.cuda.is_available() and not args.cpu:
 print(f"{Fore.GREEN}{Style.BRIGHT}Using torch device: {device_string}{Style.RESET_ALL}")
 
 if "talkinghead" in modules:
+    # Install the THA3 models if needed
+    talkinghead_models_dir = os.path.join(os.getcwd(), "talkinghead", "tha3", "models")
+    if not os.path.exists(talkinghead_models_dir):
+        # API:
+        #   https://huggingface.co/docs/huggingface_hub/en/guides/download
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError:
+            raise ImportError(
+                "You need to install huggingface_hub to install talkinghead models automatically. "
+                "See https://pypi.org/project/huggingface-hub/ for installation."
+            )
+        os.makedirs(talkinghead_models_dir, exist_ok=True)
+        print(f"THA3 models not yet installed. Installing from {args.talkinghead_models} into talkinghead/tha3/models.")
+        # TODO: I'd prefer to install with symlinks, but how about Windows users?
+        snapshot_download(repo_id=args.talkinghead_models, local_dir=talkinghead_models_dir, local_dir_use_symlinks=False)
+
     import sys
     import threading
     mode = "cuda" if args.talkinghead_gpu else "cpu"
-    print("Initializing talkinghead pipeline in " + mode + " mode....")
+    model = args.talkinghead_model
+    if model == "auto":  # default
+        # FP16 boosts the rendering performance by ~1.5x, but is only supported on GPU.
+        model = "separable_half" if args.talkinghead_gpu else "separable_float"
+    print(f"Initializing talkinghead pipeline in {mode} mode with model {model}....")
     talkinghead_path = os.path.abspath(os.path.join(os.getcwd(), "talkinghead"))
     sys.path.append(talkinghead_path) # Add the path to the 'tha3' module to the sys.path list
 
     try:
         import talkinghead.tha3.app.app as talkinghead
-        from talkinghead import *
-        def launch_talkinghead_gui():
-            talkinghead.launch_gui(mode, "separable_float")
-        #choices=['standard_float', 'separable_float', 'standard_half', 'separable_half'],
-        #choices='The device to use for PyTorch ("cuda" for GPU, "cpu" for CPU).'
-        talkinghead_thread = threading.Thread(target=launch_talkinghead_gui)
+        def launch_talkinghead():
+            # mode: choices='The device to use for PyTorch ("cuda" for GPU, "cpu" for CPU).'
+            # model: choices=['standard_float', 'separable_float', 'standard_half', 'separable_half'],
+            talkinghead.launch(mode, model)
+        talkinghead_thread = threading.Thread(target=launch_talkinghead)
         talkinghead_thread.daemon = True  # Set the thread as a daemon thread
         talkinghead_thread.start()
 
@@ -204,22 +232,11 @@ if "talkinghead" in modules:
 
 if "caption" in modules:
     print("Initializing an image captioning model...")
-    captioning_processor = AutoProcessor.from_pretrained(captioning_model)
-    if "blip" in captioning_model:
-        captioning_transformer = BlipForConditionalGeneration.from_pretrained(
-            captioning_model, torch_dtype=torch_dtype
-        ).to(device)
-    else:
-        captioning_transformer = AutoModelForCausalLM.from_pretrained(
-            captioning_model, torch_dtype=torch_dtype
-        ).to(device)
+    captioning_pipeline = pipeline('image-to-text', model=captioning_model, device=device_string, torch_dtype=torch_dtype)
 
 if "summarize" in modules:
     print("Initializing a text summarization model...")
-    summarization_tokenizer = AutoTokenizer.from_pretrained(summarization_model)
-    summarization_transformer = AutoModelForSeq2SeqLM.from_pretrained(
-        summarization_model, torch_dtype=torch_dtype
-    ).to(device)
+    summarization_pipeline = pipeline('summarization', model=summarization_model, device=device_string, torch_dtype=torch_dtype)
 
 if "sd" in modules and not sd_use_remote:
     from diffusers import StableDiffusionPipeline
@@ -441,53 +458,25 @@ def classify_text(text: str) -> list:
     return classify_module.classify_text_emotion(text)
 
 
-def caption_image(raw_image: Image, max_new_tokens: int = 20) -> str:
-    inputs = captioning_processor(raw_image.convert("RGB"), return_tensors="pt").to(
-        device, torch_dtype
-    )
-    outputs = captioning_transformer.generate(**inputs, max_new_tokens=max_new_tokens)
-    caption = captioning_processor.decode(outputs[0], skip_special_tokens=True)
+def caption_image(raw_image: Image) -> str:
+    caption = captioning_pipeline(raw_image.convert("RGB"))[0]['generated_text']
     return caption
 
 
-def summarize_chunks(text: str, params: dict) -> str:
+def summarize_chunks(text: str) -> str:
     try:
-        return summarize(text, params)
+        return summarize(text)
     except IndexError:
         print(
             "Sequence length too large for model, cutting text in half and calling again"
         )
-        new_params = params.copy()
-        new_params["max_length"] = new_params["max_length"] // 2
-        new_params["min_length"] = new_params["min_length"] // 2
         return summarize_chunks(
-            text[: (len(text) // 2)], new_params
-        ) + summarize_chunks(text[(len(text) // 2) :], new_params)
+            text[: (len(text) // 2)]
+        ) + summarize_chunks(text[(len(text) // 2) :])
 
 
-def summarize(text: str, params: dict) -> str:
-    # Tokenize input
-    inputs = summarization_tokenizer(text, return_tensors="pt").to(device)
-    token_count = len(inputs[0])
-
-    bad_words_ids = [
-        summarization_tokenizer(bad_word, add_special_tokens=False).input_ids
-        for bad_word in params["bad_words"]
-    ]
-    summary_ids = summarization_transformer.generate(
-        inputs["input_ids"],
-        num_beams=2,
-        max_new_tokens=max(token_count, int(params["max_length"])),
-        min_new_tokens=min(token_count, int(params["min_length"])),
-        repetition_penalty=float(params["repetition_penalty"]),
-        temperature=float(params["temperature"]),
-        length_penalty=float(params["length_penalty"]),
-        bad_words_ids=bad_words_ids,
-    )
-    summary = summarization_tokenizer.batch_decode(
-        summary_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
-    )[0]
-    summary = normalize_string(summary)
+def summarize(text: str) -> str:
+    summary = normalize_string(summarization_pipeline(text)[0]['summary_text'])
     return summary
 
 
@@ -640,13 +629,8 @@ def api_summarize():
     if "text" not in data or not isinstance(data["text"], str):
         abort(400, '"text" is required')
 
-    params = DEFAULT_SUMMARIZE_PARAMS.copy()
-
-    if "params" in data and isinstance(data["params"], dict):
-        params.update(data["params"])
-
     print("Summary input:", data["text"], sep="\n")
-    summary = summarize_chunks(data["text"], params)
+    summary = summarize_chunks(data["text"])
     print("Summary output:", summary, sep="\n")
     gc.collect()
     return jsonify({"summary": summary})
@@ -1116,7 +1100,7 @@ def api_websearch():
     else:
         results = websearch.search_google(query)
 
-    return jsonify({"results": results})
+    return jsonify({"results": results[0], "links": results[1]})
 
 
 if args.share:
