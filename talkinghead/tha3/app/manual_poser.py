@@ -13,7 +13,7 @@ There are two motivations:
 
   - Much faster than inpainting all 28 expressions manually in Stable Diffusion. Enables agile experimentation
     on the look of your character, since you only need to produce one new image to change the look.
-  - No CPU or GPU load while running SillyTavern, unlike the live plugin mode, which is cool, but slow.
+  - No CPU or GPU load while running SillyTavern, unlike the live plugin mode.
 
 For best results for generating the static input image in Stable Diffusion, consider the various vtuber checkpoints
 available on the internet. These should reduce the amount of work it takes to get SD to render your character in
@@ -48,10 +48,6 @@ This fork maintained by the SillyTavern-extras project.
 Manual poser app improved and documented by Juha Jeronen (@Technologicat).
 """
 
-# TODO: manual poser:
-#   - Write new README: use case and supported features are different from the original THA3 package.
-#   - Refactor stuff needed both by this and the live mode that is served by `app.py`.
-
 import argparse
 import json
 import logging
@@ -63,7 +59,7 @@ from typing import List
 
 import PIL.Image
 
-import numpy
+import numpy as np
 
 import torch
 
@@ -72,7 +68,7 @@ import wx
 from tha3.poser.modes.load_poser import load_poser
 from tha3.poser.poser import Poser, PoseParameterCategory, PoseParameterGroup
 from tha3.util import resize_PIL_image, extract_PIL_image_from_filelike, extract_pytorch_image_from_PIL_image
-from tha3.app.util import load_emotion_presets, posedict_to_pose, pose_to_posedict, torch_image_to_numpy, FpsStatistics
+from tha3.app.util import load_emotion_presets, posedict_to_pose, pose_to_posedict, torch_image_to_numpy, RunningAverage, maybe_install_models
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -365,7 +361,7 @@ class MainFrame(wx.Frame):
         self.init_right_panel()
         self.main_sizer.Fit(self)
 
-        self.fps_statistics = FpsStatistics()
+        self.fps_statistics = RunningAverage()
 
         self.timer = wx.Timer(self, wx.ID_ANY)
         self.Bind(wx.EVT_TIMER, self.update_images, self.timer)
@@ -828,8 +824,8 @@ class MainFrame(wx.Frame):
                         elapsed_time = time.time_ns() - last_update_time
                         fps = 1.0 / (elapsed_time / 10**9)
                         if self.torch_source_image is not None:
-                            self.fps_statistics.add_fps(fps)
-                        self.fps_text.SetLabelText(f"Render: {self.fps_statistics.get_average_fps():0.2f} FPS")
+                            self.fps_statistics.add_datapoint(fps)
+                        self.fps_text.SetLabelText(f"Render: {self.fps_statistics.average():0.2f} FPS")
 
                     self.update_in_progress = False
                 wx.CallAfter(update_images_cont2)
@@ -943,11 +939,40 @@ class MainFrame(wx.Frame):
                         logger.info(f"Saved image {image_file_name}")
                     except Exception as exc:
                         logger.error(f"Could not save {image_file_name}, reason: {exc}")
+
+                # Save `_emotions.json`, for use as customized emotion templates.
+                #
+                # There are three possibilities what we could do here:
+                #
+                #   - Trim away any morphs that have a zero value, because zero is the default,
+                #     optimizing for file size. But this is just a small amount of text anyway.
+                #   - Add any zero morphs that are missing. Because `self.emotions` came from files,
+                #     it might not have all keys. This yields an easily editable file that explicitly
+                #     lists what is possible.
+                #   - Just dump the data from `self.emotions` as-is. This way the content for each
+                #     emotion  matches the emotion templates in `talkinghead/emotions/*.json`.
+                #     This approach is the most transparent.
+                #
+                # At least for now, we opt for transparency. It is also the simplest to implement.
+                #
+                # Note that what we produce here is not a copy of `_defaults.json`, but instead, the result
+                # of the loading logic with fallback. That is, the content of the individual emotion files
+                # overrides the factory presets as far as `self.emotions` is concerned.
+                #
+                # We just trim away the [custom] and [reset] "emotions", which have no meaning outside the manual poser.
+                # The result will be stored in alphabetically sorted order automatically, because `dict` preserves
+                # insertion order, and `self.emotions` itself is stored alphabetically.
+                logger.info(f"Saving {dir_name}/_emotions.json...")
+                trimmed_emotions = {k: v for k, v in self.emotions.items() if not (k.startswith("[") and k.endswith("]"))}
+                emotions_json_file_name = os.path.join(dir_name, "_emotions.json")
+                with open(emotions_json_file_name, "w") as file:
+                    json.dump(trimmed_emotions, file, indent=4)
+
                 logger.info("Batch save finished.")
         finally:
             dir_dialog.Destroy()
 
-    def save_numpy_image(self, numpy_image: numpy.array, image_file_name: str) -> None:
+    def save_numpy_image(self, numpy_image: np.array, image_file_name: str) -> None:
         """Save the output image.
 
         Output format is determined by file extension (which must be supported by the installed `Pillow`).
@@ -977,26 +1002,68 @@ class MainFrame(wx.Frame):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="THA 3 Manual Poser. Pose a character image manually. Useful for generating static expression images.")
-    parser.add_argument("--model",
-                        type=str,
-                        required=False,
-                        default="separable_float",
-                        choices=["standard_float", "separable_float", "standard_half", "separable_half"],
-                        help="The model to use. 'float' means fp32, 'half' means fp16.")
     parser.add_argument("--device",
                         type=str,
                         required=False,
                         default="cuda",
                         choices=["cpu", "cuda"],
                         help='The device to use for PyTorch ("cuda" for GPU, "cpu" for CPU).')
+    parser.add_argument("--model",
+                        type=str,
+                        required=False,
+                        default="separable_float",
+                        choices=["standard_float", "separable_float", "standard_half", "separable_half"],
+                        help="The model to use. 'float' means fp32, 'half' means fp16.")
+    parser.add_argument("--models",
+                        metavar="HFREPO",
+                        type=str,
+                        help="If THA3 models are not yet installed, use the given HuggingFace repository to install them. Defaults to OktayAlpk/talking-head-anime-3.",
+                        default="OktayAlpk/talking-head-anime-3")
+    parser.add_argument("--factory-reset",
+                        metavar="EMOTION",
+                        type=str,
+                        help="Overwrite the emotion preset EMOTION with its factory default, and exit. This CANNOT be undone!",
+                        default="")
+    parser.add_argument("--factory-reset-all",
+                        action="store_true",
+                        help="Overwrite ALL emotion presets with their factory defaults, and exit. This CANNOT be undone!")
     args = parser.parse_args()
+
+    # Blunder recovery options
+    if args.factory_reset_all:
+        print("Factory-resetting all emotion templates...")
+        with open(os.path.join("emotions", "_defaults.json"), "r") as json_file:
+            factory_default_emotions = json.load(json_file)
+        factory_default_emotions.pop("zero")  # not an actual emotion
+        for key in factory_default_emotions:
+            with open(os.path.join("emotions", f"{key}.json"), "w") as file:
+                json.dump({key: factory_default_emotions[key]}, file, indent=4)
+        print("Done.")
+        sys.exit(0)
+    if args.factory_reset:
+        key = args.factory_reset
+        print(f"Factory-resetting emotion template '{key}'...")
+        with open(os.path.join("emotions", "_defaults.json"), "r") as json_file:
+            factory_default_emotions = json.load(json_file)
+        factory_default_emotions.pop("zero")  # not an actual emotion
+        if key not in factory_default_emotions:
+            print(f"No such factory-defined emotion: '{key}'. Valid values: {sorted(list(factory_default_emotions.keys()))}")
+            sys.exit(1)
+        with open(os.path.join("emotions", f"{key}.json"), "w") as file:
+            json.dump({key: factory_default_emotions[key]}, file, indent=4)
+        print("Done.")
+        sys.exit(0)
+
+    # Install the THA3 models if needed
+    modelsdir = os.path.join(os.getcwd(), "tha3", "models")
+    maybe_install_models(hf_reponame=args.models, modelsdir=modelsdir)
 
     try:
         device = torch.device(args.device)
-        poser = load_poser(args.model, device, modelsdir="tha3/models")
+        poser = load_poser(args.model, device, modelsdir=modelsdir)
     except RuntimeError as e:
         logger.error(e)
-        sys.exit()
+        sys.exit(255)
 
     # Create the "talkinghead/output" directory if it doesn't exist. This is our default save location.
     p = pathlib.Path("output").expanduser().resolve()
